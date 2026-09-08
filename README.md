@@ -25,15 +25,17 @@ Use "reasoning_effort" (or "reasoning.effort") to control thinking.
 ## 部署
 
 ```bash
+cp wrangler.toml.example wrangler.toml   # 填入你自己的 worker 名与自定义域
 npx wrangler deploy
 ```
 
-需要环境变量 `CLOUDFLARE_API_TOKEN`（Workers Scripts:Edit 权限）与 `CLOUDFLARE_ACCOUNT_ID`。
+需要环境变量 `CLOUDFLARE_API_TOKEN`（Workers Scripts:Edit 权限）与 `CLOUDFLARE_ACCOUNT_ID`。真实 `wrangler.toml` 含你的自定义域等私有信息，已列入 `.gitignore` 不入库；配置自定义域后 wrangler 默认停用 `workers.dev` 路由，仅保留自定义域。
 
 ## ZCode 侧接入
 
-将 AMD provider 的 `baseURL` 从 `https://developer.amd.com.cn/radeon/api/v1` 改为 Worker 地址（如 `https://amd-api-proxy.<subdomain>.workers.dev/v1`），API key 不变。
+将 AMD provider 的 `baseURL` 从 `https://developer.amd.com.cn/radeon/api/v1` 改为你的 Worker 地址（部署输出中的 custom domain）加 `/v1` 后缀，API key 不变。
 
 ## 已知限制
 
-AMD 端点不回传 `reasoning_content`（`reasoning_tokens` 有值但思考正文为 null），因此 DeepSeek 系模型的思考过程不可见，只有最终答案——这是 AMD 侧限制，与本代理无关。
+- AMD 端点非流式响应不回传 `reasoning_content`（`reasoning_tokens` 有值但思考正文为 null）；流式响应则会通过 `delta.reasoning` 字段回传思考文本（非 OpenAI 标准字段，客户端是否展示取决于其 SDK 支持）。
+- AMD 的 DeepSeek-V4-Flash 并发上限 80，高峰期可能返回 `model_concurrency_rate_limit_exceeded`，重试即可。
