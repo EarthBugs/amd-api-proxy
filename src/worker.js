@@ -5,8 +5,9 @@
 // 注入 thinking:{type:"enabled"}，关闭思考档注入 thinking:{type:"disabled"}），
 // AMD 网关（sglang-router）的 supported_parameters 白名单不含 thinking，
 // 收到即 400 unsupported_parameter，仅 reasoning_effort 被例外放行。
-// Qwen 等其他模型无此问题。因此本 Worker 仅对模型名含 deepseek 的请求
-// 做白名单过滤 + 档位归一，其余模型请求体原样透传（bypass）。
+// 对模型名含 deepseek 的请求做白名单过滤 + effort 归一；
+// 对模型名含 qwen 的请求做 reasoning_effort 档位归一 + 剥离 thinking
+// （Qwen 后端实测仅接受 none/low/medium/xhigh）；其余模型请求体原样透传。
 
 const AMD_BASE = "https://developer.amd.com.cn/radeon/api/v1";
 
@@ -34,6 +35,40 @@ const EFFORT_VALID = new Set(["low", "medium", "high"]);
 // 仅 DeepSeek 系模型需要适配；用关键字匹配而非枚举型号，覆盖 flash/pro/exp 及后续新模型
 function needsDeepseekFix(model) {
   return typeof model === "string" && model.toLowerCase().includes("deepseek");
+}
+
+// Qwen3.8-Flash-Next：后端仅接受 reasoning_effort ∈ none/low/medium/xhigh（实测），
+// minimal/high/max 等一律 400；thinking/rest 裸参数被 400 拒。此处把 ZCode 可能发出的
+// 各类档位 token 归一到合法集，并剥离 thinking 参数（防内核注入回潮）。
+const QWEN_EFFORT = {
+  none: "none",
+  off: "none",
+  nothink: "none",
+  disabled: "none",
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "xhigh",
+  xhigh: "xhigh",
+  max: "xhigh",
+};
+
+function sanitizeQwen(body) {
+  const out = {};
+  for (const key of Object.keys(body)) {
+    if (key !== "thinking" && key !== "reasoning") out[key] = body[key];
+  }
+  const eff = body.reasoning_effort ?? body.reasoning?.effort;
+  if (typeof eff === "string") {
+    const mapped = QWEN_EFFORT[eff.toLowerCase()];
+    if (mapped) out.reasoning_effort = mapped;
+    else delete out.reasoning_effort;
+  }
+  return out;
+}
+
+function needsQwenFix(model) {
+  return typeof model === "string" && model.toLowerCase().includes("qwen");
 }
 
 function sanitize(body) {
@@ -112,7 +147,11 @@ export default {
       return json({ error: { message: "request body must be a JSON object" } }, 400);
     }
 
-    const cleaned = needsDeepseekFix(body.model) ? sanitize(body) : body;
+    const cleaned = needsDeepseekFix(body.model)
+      ? sanitize(body)
+      : needsQwenFix(body.model)
+        ? sanitizeQwen(body)
+        : body;
     return proxy(request, target, JSON.stringify(cleaned));
   },
 };
