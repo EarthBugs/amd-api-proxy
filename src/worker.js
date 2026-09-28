@@ -8,6 +8,15 @@
 // 对模型名含 deepseek 的请求做白名单过滤 + effort 归一；
 // 对模型名含 qwen 的请求做 reasoning_effort 档位归一 + 剥离 thinking
 // （Qwen 后端实测仅接受 none/low/medium/xhigh）；其余模型请求体原样透传。
+//
+// 2026-09-28 网关升级后的新增规则（实测）：
+// - 思考力度字段的两种写法 reasoning_effort（顶层）与 reasoning.effort（嵌套）
+//   各自单发均 200，但同时出现即 400 "Cannot specify both reasoning_effort and
+//   reasoning.effort"——新版 ZCode 会把两个都发出来，故对所有模型统一去重
+//   （保留顶层 reasoning_effort，剥离整个 reasoning 对象）。
+// - GLM 系仅接受 low/medium/high（none/xhigh/max/minimal 一律 422
+//   "unknown variant"），按就近收敛归一，关闭类档位直接剥掉。
+// - MiMo 系对 none/low/medium/high/xhigh/max/minimal 全部接受，无需值归一。
 
 const AMD_BASE = "https://developer.amd.com.cn/radeon/api/v1";
 
@@ -32,10 +41,7 @@ const EFFORT_MAP = { minimal: "low", max: "high" };
 const EFFORT_OFF = new Set(["none", "off", "disabled"]);
 const EFFORT_VALID = new Set(["low", "medium", "high"]);
 
-// 仅 DeepSeek 系模型需要适配；用关键字匹配而非枚举型号，覆盖 flash/pro/exp 及后续新模型
-function needsDeepseekFix(model) {
-  return typeof model === "string" && model.toLowerCase().includes("deepseek");
-}
+// 仅 DeepSeek 系模型需要白名单适配；用关键字匹配而非枚举型号，覆盖 flash/pro/exp 及后续新模型
 
 // Qwen3.8-Flash-Next：后端仅接受 reasoning_effort ∈ none/low/medium/xhigh（实测），
 // minimal/high/max 等一律 400；thinking/rest 裸参数被 400 拒。此处把 ZCode 可能发出的
@@ -67,10 +73,6 @@ function sanitizeQwen(body) {
   return out;
 }
 
-function needsQwenFix(model) {
-  return typeof model === "string" && model.toLowerCase().includes("qwen");
-}
-
 function sanitize(body) {
   const out = {};
   for (const key of ALLOWED) {
@@ -79,11 +81,49 @@ function sanitize(body) {
   // 各客户端对思考档位的写法不一：reasoning_effort / reasoning.effort / thinking.effort
   let effort =
     body.reasoning_effort ?? body.reasoning?.effort ?? body.thinking?.effort;
-  if (typeof effort === "string" && !EFFORT_OFF.has(effort)) {
-    effort = EFFORT_MAP[effort] ?? effort;
-    if (EFFORT_VALID.has(effort)) out.reasoning_effort = effort;
+  if (typeof effort === "string") {
+    if (EFFORT_OFF.has(effort)) {
+      // 关闭类档位：剥掉 reasoning_effort（白名单阶段可能已原样带入）
+      delete out.reasoning_effort;
+    } else {
+      effort = EFFORT_MAP[effort] ?? effort;
+      if (EFFORT_VALID.has(effort)) out.reasoning_effort = effort;
+      else delete out.reasoning_effort;
+    }
   }
   return out;
+}
+
+// GLM 系（实测 2026-09-28）：reasoning_effort 仅接受 low/medium/high，
+// none/xhigh/max/minimal 一律 422 "unknown variant"；裸 thinking/reasoning 参数被拒。
+// GLM 没有 none 档，关闭思考 = 不发 reasoning_effort。
+const GLM_EFFORT = { minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "high", max: "high" };
+const GLM_OFF = new Set(["none", "off", "nothink", "disabled"]);
+
+function sanitizeGlm(body) {
+  const out = {};
+  for (const key of Object.keys(body)) {
+    if (key !== "thinking" && key !== "reasoning") out[key] = body[key];
+  }
+  const eff = body.reasoning_effort ?? body.reasoning?.effort;
+  if (typeof eff === "string") {
+    const token = eff.toLowerCase();
+    if (GLM_OFF.has(token)) delete out.reasoning_effort;
+    else if (GLM_EFFORT[token]) out.reasoning_effort = GLM_EFFORT[token];
+    else delete out.reasoning_effort;
+  }
+  return out;
+}
+
+// AMD 网关 2026-09 升级后：reasoning_effort 与 reasoning.effort 单发均可，
+// 同时出现即 400。新版 ZCode 两边都发，故对所有模型（含透传组）统一去重，
+// 保留顶层 reasoning_effort、剥离整个 reasoning 对象。
+function dedupeEffort(body) {
+  if (body.reasoning_effort !== undefined && body.reasoning !== undefined) {
+    const { reasoning, ...rest } = body;
+    return rest;
+  }
+  return body;
 }
 
 async function proxy(srcReq, target, jsonBody) {
@@ -147,11 +187,14 @@ export default {
       return json({ error: { message: "request body must be a JSON object" } }, 400);
     }
 
-    const cleaned = needsDeepseekFix(body.model)
+    const model = typeof body.model === "string" ? body.model.toLowerCase() : "";
+    const cleaned = model.includes("deepseek")
       ? sanitize(body)
-      : needsQwenFix(body.model)
+      : model.includes("qwen")
         ? sanitizeQwen(body)
-        : body;
-    return proxy(request, target, JSON.stringify(cleaned));
+        : model.includes("glm")
+          ? sanitizeGlm(body)
+          : body;
+    return proxy(request, target, JSON.stringify(dedupeEffort(cleaned)));
   },
 };
